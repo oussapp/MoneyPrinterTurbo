@@ -1,24 +1,142 @@
-x-common-volumes: &common-volumes
-  - ./:/MoneyPrinterTurbo
+# ============================================================
+# MoneyPrinterTurbo SaaS — Docker Compose (Development)
+# ============================================================
+# Usage:
+#   docker-compose up -d          # Start all services
+#   docker-compose logs -f api    # Follow API logs
+#   docker-compose exec api bash  # Shell into API container
+# ============================================================
+
+version: "3.9"
 
 services:
-  webui:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: "moneyprinterturbo-webui"
+  # ── PostgreSQL ──
+  postgres:
+    image: postgres:16-alpine
+    container_name: mpt_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mpt_user
+      POSTGRES_PASSWORD: mpt_pass
+      POSTGRES_DB: moneyprinter
     ports:
-      - "8501:8501"
-    command: [ "streamlit", "run", "./webui/Main.py","--browser.serverAddress=127.0.0.1","--server.enableCORS=True","--browser.gatherUsageStats=False" ]
-    volumes: *common-volumes
-    restart: always
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mpt_user -d moneyprinter"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ──
+  redis:
+    image: redis:7-alpine
+    container_name: mpt_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI Backend ──
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: "moneyprinterturbo-api"
+    container_name: mpt_api
+    restart: unless-stopped
     ports:
       - "8080:8080"
-    command: [ "python3", "main.py" ]
-    volumes: *common-volumes
-    restart: always
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://mpt_user:mpt_pass@postgres:5432/moneyprinter
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./:/app
+      - storage_data:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "
+        python -c 'from app.models.database import create_tables; create_tables()' &&
+        uvicorn app.asgi:app --host 0.0.0.0 --port 8080 --reload
+      "
+
+  # ── Celery Worker ──
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mpt_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://mpt_user:mpt_pass@postgres:5432/moneyprinter
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./:/app
+      - storage_data:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A celery_app.celery_app worker
+        --loglevel=info
+        --concurrency=2
+        --max-tasks-per-child=10
+        -Q default
+
+  # ── Celery Beat (Scheduler) ──
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mpt_beat
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://mpt_user:mpt_pass@postgres:5432/moneyprinter
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A celery_app.celery_app beat
+        --loglevel=info
+
+  # ── Next.js Frontend ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: mpt_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: dev-secret-change-me
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  storage_data:
